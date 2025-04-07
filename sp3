@@ -1,0 +1,88 @@
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+import base64
+import re
+
+# Constants
+SITE_URL = ""
+client_id = ""
+client_secret = ""
+root_folder_path = ""
+
+# Authenticate
+credentials = ClientCredential(client_id, client_secret)
+ctx = ClientContext(SITE_URL).with_credentials(credentials)
+
+
+def get_file_base64(file):
+    try:
+        file_response = file.read().execute_query()
+        return base64.b64encode(file_response.content).decode("utf-8")
+    except Exception as e:
+        print(f"[ERROR] Failed to read file {file.properties['Name']}: {e}")
+        return None
+
+
+def parse_year_quarter(folder_name):
+    # e.g., "Q1 2025" → ("Q1", 2025)
+    match = re.match(r"(Q\d)[ _-]?(\d{4})", folder_name.strip())
+    return match.groups() if match else ("UNKNOWN", "UNKNOWN")
+
+
+def traverse_folder(folder, year=None, quarter=None, industry=None, obligor=None):
+    result = []
+    folder_name = folder.properties["Name"]
+
+    # Parse quarter and year if not yet set
+    if not (quarter and year) and re.match(r"Q\d[ _-]?\d{4}", folder_name):
+        quarter, year = parse_year_quarter(folder_name)
+
+    # Folder name level inference
+    if not industry and any(i in folder_name.upper() for i in ["CRE", "C&I"]):
+        industry = folder_name
+
+    if not obligor and industry and folder_name != industry:
+        obligor = folder_name
+
+    # Load all subfolders and files
+    folder.expand(["Folders", "Files"]).get().execute_query()
+
+    # Recurse into subfolders
+    for subfolder in folder.folders:
+        result.extend(traverse_folder(subfolder, year, quarter, industry, obligor))
+
+    # Handle files
+    for file in folder.files:
+        base64_data = get_file_base64(file)
+        if base64_data:
+            result.append({
+                "doc_id": file.properties["UniqueId"],
+                "original_filename": file.properties["Name"],
+                "base64": base64_data,
+                "sharepoint_info": {
+                    "server_relative_url": file.properties["ServerRelativeUrl"],
+                    "file_path": file.properties["ServerRelativeUrl"].split("/")[-1]
+                },
+                "year": int(year) if year.isdigit() else None,
+                "quarter": quarter,
+                "industry": industry,
+                "obligor_name": obligor
+            })
+
+    return result
+
+
+def main():
+    folder = ctx.web.get_folder_by_server_relative_url(root_folder_path)
+    folder.expand(["Folders", "Files"]).get().execute_query()
+
+    print(f"📁 Traversing SharePoint folder: {folder.properties['Name']}")
+    files_metadata = traverse_folder(folder)
+
+    print("\n📄 Final JSON Output:")
+    from pprint import pprint
+    pprint(files_metadata)
+
+
+if __name__ == "__main__":
+    main()
