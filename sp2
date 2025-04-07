@@ -1,0 +1,123 @@
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+import base64
+import hashlib
+import json
+import uuid
+import os
+
+# --- CONFIG ---
+SITE_URL = ""
+CLIENT_ID = "your-client-id"
+CLIENT_SECRET = "your-client-secret"
+START_FOLDER = "Shared Documents/General/test_bank/Q1 2025"
+# --------------
+
+credentials = ClientCredential(CLIENT_ID, CLIENT_SECRET)
+ctx = ClientContext(SITE_URL).with_credentials(credentials)
+
+
+def encode_file_base64(file_obj):
+    content = file_obj.read().execute_query().value
+    return base64.b64encode(content).decode("utf-8")
+
+
+def get_hash(base64_string):
+    return hashlib.md5(base64_string.encode()).hexdigest()
+
+
+def process_obligor_folder(folder, industry, year, quarter):
+    ctx.load(folder.files)
+    ctx.execute_query()
+
+    obligor_name = folder.properties["Name"]
+    doc_run_id = f"{industry}_{quarter}_{year}_{obligor_name.replace(' ', '_')}"
+    documents = []
+
+    for file in folder.files:
+        filename = file.properties["Name"]
+        file_url = file.properties["ServerRelativeUrl"]
+
+        try:
+            base64_content = encode_file_base64(file)
+        except Exception as e:
+            print(f"❌ Failed to read {filename}: {e}")
+            continue
+
+        documents.append({
+            "doc_id": str(uuid.uuid4())[:6].upper(),
+            "original_filename": filename,
+            "base64": base64_content,
+            "file_hash": get_hash(base64_content),
+            "status": {
+                "text_extraction": "PENDING",
+                "vector_indexing": "PENDING"
+            },
+            "renamed_filename": None,
+            "blob_path": None,
+            "sas_url": None,
+            "sharepoint_info": {
+                "source_url": file_url,
+                "folder_path": folder.properties["ServerRelativeUrl"],
+                "uploaded_by": "Script"
+            },
+            "steps": []
+        })
+
+    return {
+        "obligor_name": obligor_name,
+        "doc_run_id": doc_run_id,
+        "documents": documents
+    }
+
+
+def process_industry_folder(folder, year, quarter):
+    ctx.load(folder.folders)
+    ctx.execute_query()
+
+    industry = folder.properties["Name"]
+    obligors = []
+
+    for obligor_folder in folder.folders:
+        ctx.load(obligor_folder)
+        ctx.execute_query()
+        obligor_data = process_obligor_folder(obligor_folder, industry, year, quarter)
+        obligors.append(obligor_data)
+
+    return {
+        "industry": industry,
+        "obligors": obligors
+    }
+
+
+def main():
+    # Get Quarter/Year from START_FOLDER
+    try:
+        quarter, year = os.path.basename(START_FOLDER).split(" ")
+    except Exception:
+        raise ValueError("Folder name must end in 'Q# YYYY', e.g., 'Q1 2025'")
+
+    print(f"🔍 Starting metadata extraction for Quarter: {quarter}, Year: {year}")
+
+    root_folder = ctx.web.get_folder_by_server_relative_url(f"/sites/AppleBankAndCitiPOC/{START_FOLDER}")
+    ctx.load(root_folder.folders)
+    ctx.execute_query()
+
+    industries = []
+    for industry_folder in root_folder.folders:
+        ctx.load(industry_folder)
+        ctx.execute_query()
+        industries.append(process_industry_folder(industry_folder, year, quarter))
+
+    final_json = {
+        "year": int(year),
+        "quarter": quarter,
+        "industries": industries
+    }
+
+    print("✅ Final metadata extracted:\n")
+    print(json.dumps(final_json, indent=2))
+
+
+if __name__ == "__main__":
+    main()
