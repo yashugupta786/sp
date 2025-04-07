@@ -1,0 +1,113 @@
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+import base64
+import json
+import os
+
+# SharePoint config
+SITE_URL = ""
+CLIENT_ID = ""
+CLIENT_SECRET = ""
+ROOT_FOLDER = ""
+
+credentials = ClientCredential(CLIENT_ID, CLIENT_SECRET)
+ctx = ClientContext(SITE_URL).with_credentials(credentials)
+
+
+def get_file_base64(file):
+    try:
+        file_name = file.properties["Name"]
+        download = file.open_binary(ctx)
+        content = download.content
+        return base64.b64encode(content).decode("utf-8")
+    except Exception as e:
+        print(f"[ERROR] Failed to read file {file.properties['Name']}: {e}")
+        return None
+
+
+def traverse_folder(folder, year, quarter, industry=None, obligor=None):
+    folder.ensure_property("Folders")
+    folder.ensure_property("Files")
+
+    result = []
+
+    # Traverse subfolders first
+    for subfolder in folder.folders:
+        name = subfolder.properties["Name"]
+
+        if industry is None:
+            result.extend(traverse_folder(subfolder, year, quarter, industry=name))
+        elif obligor is None:
+            result.extend(traverse_folder(subfolder, year, quarter, industry=industry, obligor=name))
+        else:
+            result.extend(traverse_folder(subfolder, year, quarter, industry=industry, obligor=obligor))
+
+    # Handle files
+    for file in folder.files:
+        base64_data = get_file_base64(file)
+        if base64_data:
+            result.append({
+                "doc_id": os.path.splitext(file.properties["Name"])[0],
+                "original_filename": file.properties["Name"],
+                "base64": base64_data,
+                "file_hash": "hash_placeholder",
+                "status": {
+                    "text_extraction": "PENDING",
+                    "vector_indexing": "PENDING"
+                },
+                "renamed_filename": None,
+                "blob_path": None,
+                "sas_url": None,
+                "sharepoint_info": {
+                    "path": file.properties.get("ServerRelativeUrl", "")
+                }
+            })
+
+    return result
+
+
+if __name__ == "__main__":
+    # Extract metadata from path
+    parts = ROOT_FOLDER.strip("/").split("/")
+    year_quarter = parts[-1].split()
+    year = int(year_quarter[1])
+    quarter = year_quarter[0].upper()
+
+    print(f"\n🔍 Traversing SharePoint folder: {quarter} {year}\n")
+
+    root_folder = ctx.web.get_folder_by_server_relative_url(ROOT_FOLDER)
+    ctx.load(root_folder)
+    ctx.execute_query()
+
+    all_documents = traverse_folder(root_folder, year=year, quarter=quarter)
+
+    # Wrap in final metadata format
+    if all_documents:
+        json_output = {
+            "run_id": "SAMPLE_RUN_ID",
+            "tenant_id": "sample_tenant",
+            "engagement_id": "sample_engagement",
+            "metadata": [
+                {
+                    "year": year,
+                    "quarter": quarter,
+                    "industries": [
+                        {
+                            "industry": doc["sharepoint_info"]["path"].split("/")[-3],
+                            "obligors": [
+                                {
+                                    "obligor_name": doc["sharepoint_info"]["path"].split("/")[-2],
+                                    "doc_run_id": f"{doc["sharepoint_info"]["path"].split("/")[-3]}_{quarter}_{year}_{doc["sharepoint_info"]["path"].split("/")[-2]}",
+                                    "documents": [doc]
+                                }
+                            ]
+                        } for doc in all_documents
+                    ]
+                }
+            ]
+        }
+
+        print("\n✅ Extracted JSON:")
+        print(json.dumps(json_output, indent=2))
+    else:
+        print("\n⚠️ No files found to process.")
