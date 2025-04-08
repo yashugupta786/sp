@@ -1,0 +1,184 @@
+import base64
+import os
+import re
+import io
+import uuid
+from datetime import datetime
+from pymongo import MongoClient
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+
+# ------------------- CONFIG -------------------
+SITE_URL = ""
+CLIENT_ID = "your-client-id"
+CLIENT_SECRET = "your-client-secret"
+
+MONGO_URI = "mongodb://localhost:27017"
+DB_NAME = "test"
+COLL_MANAGEMENT = "run_management"
+COLL_DOCUMENTS = "run_documents"
+# ---------------------------------------------
+
+def extract_year_quarter(folder_name):
+    match = re.match(r"(?i)(Q[1-4])[_\s]?(\d{4})", folder_name.strip())
+    if match:
+        return match.group(2), match.group(1).upper()
+    return None, None
+
+def get_base64_content(ctx, file_obj):
+    try:
+        file_url = file_obj.properties["ServerRelativeUrl"]
+        file = ctx.web.get_file_by_server_relative_url(file_url)
+        mem_file = io.BytesIO()
+        file.download(mem_file).execute_query()
+        mem_file.seek(0)
+        return base64.b64encode(mem_file.read()).decode("utf-8")
+    except Exception as e:
+        print(f"[ERROR] Failed reading {file_obj.properties['Name']}: {e}")
+        return None
+
+def process_files(ctx, folder):
+    ctx.load(folder.expand(["Folders", "Files"]))
+    ctx.execute_query()
+    all_files = list(folder.files)
+    for subfolder in folder.folders:
+        all_files.extend(process_files(ctx, subfolder))
+    return all_files
+
+def traverse_and_store(ctx, root_folder, tenant_id, engagement_id, year, quarter, run_id, db):
+    ctx.load(root_folder.expand(["Folders"]))
+    ctx.execute_query()
+
+    for industry_folder in root_folder.folders:
+        industry = industry_folder.properties["Name"]
+        ctx.load(industry_folder.expand(["Folders"]))
+        ctx.execute_query()
+
+        for obligor_folder in industry_folder.folders:
+            obligor = obligor_folder.properties["Name"]
+            doc_run_id = f"{industry}_{quarter}_{year}_{obligor.replace(' ', '_')}"
+
+            ctx.load(obligor_folder.expand(["Folders", "Files"]))
+            ctx.execute_query()
+
+            # Collect existing base64s from run_documents for this doc_run_id
+            existing_docs = list(db[COLL_DOCUMENTS].find({"doc_run_id": doc_run_id}, {"base64": 1}))
+            existing_base64s = set(doc["base64"] for doc in existing_docs)
+
+            all_files = process_files(ctx, obligor_folder)
+            new_documents = []
+            seen_base64s = set()
+
+            for file_obj in all_files:
+                base64_str = get_base64_content(ctx, file_obj)
+                if not base64_str:
+                    continue
+
+                if base64_str in existing_base64s or base64_str in seen_base64s:
+                    print(f"[SKIP] Duplicate content for file: {file_obj.properties['Name']}")
+                    continue
+
+                seen_base64s.add(base64_str)
+                print(f"[UPLOAD] New file: {file_obj.properties['Name']}")
+                new_documents.append({
+                    "doc_run_id": doc_run_id,
+                    "run_id": run_id,
+                    "tenant_id": tenant_id,
+                    "engagement_id": engagement_id,
+                    "year": int(year),
+                    "quarter": quarter,
+                    "industry_type": industry,
+                    "obligor_name": obligor,
+                    "doc_id": str(uuid.uuid4()),
+                    "original_filename": file_obj.properties["Name"],
+                    "renamed_filename": f"{file_obj.properties['Name'].rsplit('.', 1)[0]}_{industry}_{quarter}_{year}_{obligor.replace(' ', '')}.pdf",
+                    "base64": base64_str,
+                    "file_hash": "hash_placeholder",
+                    "status": {},
+                    "blob_path": "",
+                    "sas_url": "",
+                    "sharepoint_info": {
+                        "relative_path": file_obj.properties["ServerRelativeUrl"],
+                        "library_name": "Documents",
+                        "site_url": SITE_URL
+                    },
+                    "steps": [
+                        {
+                            "step_name": "sharepoint_ingestion",
+                            "result": "SUCCESS",
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                    ]
+                })
+
+            if new_documents:
+                db[COLL_DOCUMENTS].insert_many(new_documents)
+
+            # Update run_management schema
+            existing_run = db[COLL_MANAGEMENT].find_one({"run_id": run_id})
+            updated = False
+
+            for meta in existing_run["metadata"]:
+                if meta["year"] == int(year) and meta["quarter"] == quarter:
+                    for ind in meta["industries"]:
+                        if ind["industry"] == industry:
+                            if not any(ob["obligor_name"] == obligor for ob in ind["obligors"]):
+                                ind["obligors"].append({"obligor_name": obligor, "doc_run_id": doc_run_id})
+                                updated = True
+                            break
+                    else:
+                        meta["industries"].append({"industry": industry, "obligors": [{"obligor_name": obligor, "doc_run_id": doc_run_id}]})
+                        updated = True
+                    break
+            else:
+                existing_run["metadata"].append({
+                    "year": int(year),
+                    "quarter": quarter,
+                    "industries": [{"industry": industry, "obligors": [{"obligor_name": obligor, "doc_run_id": doc_run_id}]}]
+                })
+                updated = True
+
+            if updated:
+                db[COLL_MANAGEMENT].replace_one({"run_id": run_id}, existing_run)
+                print(f"[UPDATED] Added/merged obligor '{obligor}' under {industry}, {quarter} {year}")
+
+def ensure_run_id(tenant_id, engagement_id, db):
+    existing = db[COLL_MANAGEMENT].find_one({"tenant_id": tenant_id, "engagement_id": engagement_id})
+    if existing:
+        return existing["run_id"]
+    new_run_id = f"RUN{str(db[COLL_MANAGEMENT].estimated_document_count() + 1).zfill(3)}"
+    db[COLL_MANAGEMENT].insert_one({
+        "run_id": new_run_id,
+        "tenant_id": tenant_id,
+        "engagement_id": engagement_id,
+        "metadata": []
+    })
+    return new_run_id
+
+def main(sp_folder_path, tenant_id, engagement_id):
+    folder_name = sp_folder_path.strip("/").split("/")[-1]
+    year, quarter = extract_year_quarter(folder_name)
+    if not year or not quarter:
+        print("[ERROR] Could not parse quarter/year from folder name.")
+        return
+
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+
+    run_id = ensure_run_id(tenant_id, engagement_id, db)
+
+    credentials = ClientCredential(CLIENT_ID, CLIENT_SECRET)
+    ctx = ClientContext(SITE_URL).with_credentials(credentials)
+
+    folder = ctx.web.get_folder_by_server_relative_url(sp_folder_path)
+    ctx.load(folder)
+    ctx.execute_query()
+
+    traverse_and_store(ctx, folder, tenant_id, engagement_id, year, quarter, run_id, db)
+
+# Entry point
+if __name__ == "__main__":
+    sp_folder_path = "/sites/AppleBankAndCitiPOC/Shared Documents/General/test_bank22/Q1 2025"
+    tenant_id = "medconnect"
+    engagement_id = "applebank"
+    main(sp_folder_path, tenant_id, engagement_id)
