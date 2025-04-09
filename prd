@@ -1,0 +1,260 @@
+# ✅ Final Refactored Production-Grade SharePoint Ingestion Code
+
+# Folder Structure:
+# ├── app/
+# │   ├── db/
+# │   │   └── mongo_ops.py
+# │   ├── model/
+# │   │   └── sharepoint_metadata.py
+# │   ├── sharepoint/
+# │   │   ├── processor.py
+# │   │   └── utils.py
+# │   └── test_sharepoint.py
+
+# ---------------- app/db/mongo_ops.py ----------------
+from pymongo import MongoClient
+
+MONGO_URI = "mongodb://localhost:27017"
+DB_NAME = "test"
+
+def get_mongo_client():
+    """Connect to MongoDB and return the DB object."""
+    client = MongoClient(MONGO_URI)
+    return client[DB_NAME]
+
+# ---------------- app/model/sharepoint_metadata.py ----------------
+from typing import Optional, List
+from pydantic import BaseModel
+
+class StatusModel(BaseModel):
+    text_extraction: Optional[str] = ""
+    vector_indexing: Optional[str] = ""
+
+class SharePointInfoModel(BaseModel):
+    relative_path: str
+    library_name: str
+    site_url: str
+
+class StepModel(BaseModel):
+    step_name: str
+    result: str
+    timestamp: str
+
+class DocumentModel(BaseModel):
+    doc_run_id: str
+    run_id: str
+    tenant_id: str
+    engagement_id: str
+    year: int
+    quarter: str
+    industry_type: str
+    obligor_name: str
+    doc_id: str
+    original_filename: str
+    renamed_filename: str = ""
+    base64: str
+    file_hash: str = "hash_placeholder"
+    status: StatusModel = StatusModel()
+    blob_path: str = ""
+    sas_url: str = ""
+    sharepoint_info: SharePointInfoModel
+    steps: List[StepModel]
+
+# ---------------- app/sharepoint/utils.py ----------------
+import base64
+import io
+import re
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+
+SITE_URL = "?"
+CLIENT_ID = "your-client-id"
+CLIENT_SECRET = "your-client-secret"
+
+def extract_year_quarter(folder_name: str):
+    """Extract year and quarter from folder name like Q1_2025 or Q1 2025."""
+    match = re.match(r"(?i)(Q[1-4])[_\s]?(\d{4})", folder_name.strip())
+    if match:
+        return match.group(2), match.group(1).upper()
+    return None, None
+
+def get_client_context():
+    """Return SharePoint client context."""
+    credentials = ClientCredential(CLIENT_ID, CLIENT_SECRET)
+    return ClientContext(SITE_URL).with_credentials(credentials)
+
+def get_base64_content(ctx, file_obj):
+    """Get base64 encoded content of SharePoint file without saving locally."""
+    try:
+        file_url = file_obj.properties["ServerRelativeUrl"]
+        file = ctx.web.get_file_by_server_relative_url(file_url)
+        mem_file = io.BytesIO()
+        file.download(mem_file).execute_query()
+        mem_file.seek(0)
+        return base64.b64encode(mem_file.read()).decode("utf-8")
+    except Exception as e:
+        print(f"[ERROR] Reading file content: {e}")
+        return None
+
+async def fetch_all_files(ctx, folder):
+    """Recursively collect all files from SharePoint folder and subfolders."""
+    ctx.load(folder.expand(["Folders", "Files"]))
+    ctx.execute_query()
+    all_files = list(folder.files)
+    for subfolder in folder.folders:
+        all_files.extend(await fetch_all_files(ctx, subfolder))
+    return all_files
+
+# ---------------- app/sharepoint/processor.py ----------------
+import uuid
+from datetime import datetime
+from app.sharepoint.utils import extract_year_quarter, get_client_context, get_base64_content, fetch_all_files
+from app.model.sharepoint_metadata import DocumentModel
+
+COLL_MANAGEMENT = "run_management"
+COLL_DOCUMENTS = "run_documents"
+
+class SharePointProcessor:
+    """
+    Core class for processing SharePoint folders, deduplication,
+    and storing results in MongoDB under a two-collection design.
+    """
+    def __init__(self, db):
+        self.db = db
+
+    def ensure_run_id(self, tenant_id: str, engagement_id: str) -> str:
+        """Ensure a run_id exists for a given tenant and engagement."""
+        existing = self.db[COLL_MANAGEMENT].find_one({"tenant_id": tenant_id, "engagement_id": engagement_id})
+        if existing:
+            return existing["run_id"]
+        run_id = f"RUN{str(self.db[COLL_MANAGEMENT].estimated_document_count() + 1).zfill(3)}"
+        self.db[COLL_MANAGEMENT].insert_one({
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "engagement_id": engagement_id,
+            "metadata": []
+        })
+        return run_id
+
+    async def process(self, sp_folder_path: str, tenant_id: str, engagement_id: str):
+        """Ingest files from SharePoint folder and insert into MongoDB."""
+        folder_name = sp_folder_path.strip("/").split("/")[-1]
+        year, quarter = extract_year_quarter(folder_name)
+        if not year or not quarter:
+            return {"success": False, "message": "Invalid folder name format for year/quarter."}
+
+        try:
+            ctx = get_client_context()
+            folder = ctx.web.get_folder_by_server_relative_url(sp_folder_path)
+            ctx.load(folder)
+            ctx.execute_query()
+        except Exception as e:
+            return {"success": False, "message": f"SharePoint path error: {e}"}
+
+        run_id = self.ensure_run_id(tenant_id, engagement_id)
+        ctx.load(folder.expand(["Folders"]))
+        ctx.execute_query()
+
+        try:
+            for industry_folder in folder.folders:
+                industry = industry_folder.properties["Name"]
+                ctx.load(industry_folder.expand(["Folders"]))
+                ctx.execute_query()
+
+                for obligor_folder in industry_folder.folders:
+                    obligor = obligor_folder.properties["Name"]
+                    doc_run_id = f"{industry}_{quarter}_{year}_{obligor.replace(' ', '_')}"
+
+                    ctx.load(obligor_folder.expand(["Folders", "Files"]))
+                    ctx.execute_query()
+                    all_files = await fetch_all_files(ctx, obligor_folder)
+
+                    existing_base64s = set(
+                        doc["base64"] for doc in self.db[COLL_DOCUMENTS].find({"doc_run_id": doc_run_id}, {"base64": 1})
+                    )
+                    seen_base64s = set()
+                    new_docs = []
+
+                    for file_obj in all_files:
+                        base64_str = get_base64_content(ctx, file_obj)
+                        if not base64_str or base64_str in seen_base64s or base64_str in existing_base64s:
+                            continue
+                        seen_base64s.add(base64_str)
+
+                        doc_data = DocumentModel(
+                            doc_run_id=doc_run_id,
+                            run_id=run_id,
+                            tenant_id=tenant_id,
+                            engagement_id=engagement_id,
+                            year=int(year),
+                            quarter=quarter,
+                            industry_type=industry,
+                            obligor_name=obligor,
+                            doc_id=str(uuid.uuid4()),
+                            original_filename=file_obj.properties["Name"],
+                            base64=base64_str,
+                            sharepoint_info={
+                                "relative_path": file_obj.properties["ServerRelativeUrl"],
+                                "library_name": "Documents",
+                                "site_url": ctx.base_url
+                            },
+                            steps=[{
+                                "step_name": "sharepoint_ingestion",
+                                "result": "SUCCESS",
+                                "timestamp": datetime.utcnow().isoformat()
+                            }]
+                        )
+                        new_docs.append(doc_data.dict())
+
+                    if new_docs:
+                        self.db[COLL_DOCUMENTS].insert_many(new_docs)
+                        self._update_management(run_id, year, quarter, industry, obligor, doc_run_id)
+
+        except Exception as e:
+            return {"success": False, "message": f"Error during folder processing: {e}"}
+
+        return {"success": True, "run_id": run_id, "message": "Documents processed successfully."}
+
+    def _update_management(self, run_id, year, quarter, industry, obligor, doc_run_id):
+        """Update run_management structure based on incoming document run."""
+        run_doc = self.db[COLL_MANAGEMENT].find_one({"run_id": run_id})
+        updated = False
+        for meta in run_doc["metadata"]:
+            if meta["year"] == int(year) and meta["quarter"] == quarter:
+                for ind in meta["industries"]:
+                    if ind["industry"] == industry:
+                        if not any(o["obligor_name"] == obligor for o in ind["obligors"]):
+                            ind["obligors"].append({"obligor_name": obligor, "doc_run_id": doc_run_id})
+                            updated = True
+                        break
+                else:
+                    meta["industries"].append({"industry": industry, "obligors": [{"obligor_name": obligor, "doc_run_id": doc_run_id}]})
+                    updated = True
+                break
+        else:
+            run_doc["metadata"].append({
+                "year": int(year),
+                "quarter": quarter,
+                "industries": [{"industry": industry, "obligors": [{"obligor_name": obligor, "doc_run_id": doc_run_id}]}]
+            })
+            updated = True
+        if updated:
+            self.db[COLL_MANAGEMENT].replace_one({"_id": run_doc["_id"]}, run_doc)
+
+# ---------------- test_sharepoint.py ----------------
+import asyncio
+from app.db.mongo_ops import get_mongo_client
+from app.sharepoint.processor import SharePointProcessor
+
+async def run_test():
+    db = get_mongo_client()
+    processor = SharePointProcessor(db)
+    result = await processor.process(
+        sp_folder_path="/sites/AppleBankAndCitiPOC/Shared Documents/General/test_bank22/Q1 2025",
+        tenant_id="medconnect",
+        engagement_id="applebank"
+    )
+    print(result)
+
+if __name__ == "__main__":
+    asyncio.run(run_test())
