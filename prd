@@ -1,28 +1,31 @@
-# ✅ Final Refactored Production-Grade SharePoint Ingestion Code
+# ---------------- app/config/settings.yaml ----------------
+site_url: "https://tes/AppleBankAndCitiPOC"
+client_id: "your-client-id"
+client_secret: "your-client-secret"
+mongo_uri: "mongodb://localhost:27017"
+database: "test"
 
-# Folder Structure:
-# ├── app/
-# │   ├── db/
-# │   │   └── mongo_ops.py
-# │   ├── model/
-# │   │   └── sharepoint_metadata.py
-# │   ├── sharepoint/
-# │   │   ├── processor.py
-# │   │   └── utils.py
-# │   └── test_sharepoint.py
-
-# ---------------- app/db/mongo_ops.py ----------------
+# ---------------- app/db/mongo_client.py ----------------
+import yaml
 from pymongo import MongoClient
 
-MONGO_URI = "mongodb://localhost:27017"
-DB_NAME = "test"
+class MongoConnector:
+    """
+    Handles MongoDB client creation and database connection
+    by reading from a YAML config file.
+    """
+    def __init__(self, config_path="app/config/settings.yaml"):
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        self.mongo_uri = config["mongo_uri"]
+        self.db_name = config["database"]
 
-def get_mongo_client():
-    """Connect to MongoDB and return the DB object."""
-    client = MongoClient(MONGO_URI)
-    return client[DB_NAME]
+    def get_database(self):
+        """Returns the database instance from MongoClient."""
+        client = MongoClient(self.mongo_uri)
+        return client[self.db_name]
 
-# ---------------- app/model/sharepoint_metadata.py ----------------
+# ---------------- app/model/document_schema.py ----------------
 from typing import Optional, List
 from pydantic import BaseModel
 
@@ -60,70 +63,90 @@ class DocumentModel(BaseModel):
     sharepoint_info: SharePointInfoModel
     steps: List[StepModel]
 
-# ---------------- app/sharepoint/utils.py ----------------
+# ---------------- app/sharepoint/client.py ----------------
 import base64
 import io
 import re
 from office365.sharepoint.client_context import ClientContext
 from office365.runtime.auth.client_credential import ClientCredential
 
-SITE_URL = "?"
-CLIENT_ID = "your-client-id"
-CLIENT_SECRET = "your-client-secret"
+class SharePointClient:
+    """
+    SharePoint client to handle authentication and file operations.
+    """
+    def __init__(self, site_url: str, client_id: str, client_secret: str):
+        credentials = ClientCredential(client_id, client_secret)
+        self.ctx = ClientContext(site_url).with_credentials(credentials)
+        self.site_url = site_url
 
-def extract_year_quarter(folder_name: str):
-    """Extract year and quarter from folder name like Q1_2025 or Q1 2025."""
-    match = re.match(r"(?i)(Q[1-4])[_\s]?(\d{4})", folder_name.strip())
-    if match:
-        return match.group(2), match.group(1).upper()
-    return None, None
+    def get_context(self):
+        """Returns the initialized SharePoint context."""
+        return self.ctx
 
-def get_client_context():
-    """Return SharePoint client context."""
-    credentials = ClientCredential(CLIENT_ID, CLIENT_SECRET)
-    return ClientContext(SITE_URL).with_credentials(credentials)
+    def get_folder(self, path: str):
+        """Fetches a SharePoint folder by its relative URL."""
+        folder = self.ctx.web.get_folder_by_server_relative_url(path)
+        self.ctx.load(folder)
+        self.ctx.execute_query()
+        return folder
 
-def get_base64_content(ctx, file_obj):
-    """Get base64 encoded content of SharePoint file without saving locally."""
-    try:
-        file_url = file_obj.properties["ServerRelativeUrl"]
-        file = ctx.web.get_file_by_server_relative_url(file_url)
-        mem_file = io.BytesIO()
-        file.download(mem_file).execute_query()
-        mem_file.seek(0)
-        return base64.b64encode(mem_file.read()).decode("utf-8")
-    except Exception as e:
-        print(f"[ERROR] Reading file content: {e}")
-        return None
+    def get_base64_content(self, file_obj):
+        """
+        Reads file content from SharePoint and returns it as a base64 string.
+        """
+        try:
+            file_url = file_obj.properties["ServerRelativeUrl"]
+            file = self.ctx.web.get_file_by_server_relative_url(file_url)
+            mem_file = io.BytesIO()
+            file.download(mem_file).execute_query()
+            mem_file.seek(0)
+            return base64.b64encode(mem_file.read()).decode("utf-8")
+        except Exception as e:
+            print(f"[ERROR] Reading file content: {e}")
+            return None
 
-async def fetch_all_files(ctx, folder):
-    """Recursively collect all files from SharePoint folder and subfolders."""
-    ctx.load(folder.expand(["Folders", "Files"]))
-    ctx.execute_query()
-    all_files = list(folder.files)
-    for subfolder in folder.folders:
-        all_files.extend(await fetch_all_files(ctx, subfolder))
-    return all_files
+    async def fetch_all_files(self, folder):
+        """
+        Recursively fetches all files from a given SharePoint folder.
+        """
+        self.ctx.load(folder.expand(["Folders", "Files"]))
+        self.ctx.execute_query()
+        all_files = list(folder.files)
+        for subfolder in folder.folders:
+            all_files.extend(await self.fetch_all_files(subfolder))
+        return all_files
 
-# ---------------- app/sharepoint/processor.py ----------------
+    @staticmethod
+    def extract_year_quarter(folder_name: str):
+        """
+        Extracts year and quarter (e.g., Q1_2025 or Q1 2025).
+        """
+        match = re.match(r"(?i)(Q[1-4])[_\s]?(\d{4})", folder_name.strip())
+        if match:
+            return match.group(2), match.group(1).upper()
+        return None, None
+
+# ---------------- app/sharepoint/ingestion_service.py ----------------
 import uuid
 from datetime import datetime
-from app.sharepoint.utils import extract_year_quarter, get_client_context, get_base64_content, fetch_all_files
-from app.model.sharepoint_metadata import DocumentModel
+from app.model.document_schema import DocumentModel
 
 COLL_MANAGEMENT = "run_management"
 COLL_DOCUMENTS = "run_documents"
 
-class SharePointProcessor:
+class SharePointIngestionService:
     """
-    Core class for processing SharePoint folders, deduplication,
-    and storing results in MongoDB under a two-collection design.
+    Handles business logic for SharePoint file ingestion and MongoDB updates.
     """
-    def __init__(self, db):
+    def __init__(self, db, config):
         self.db = db
+        self.config = config
+        self.site_url = config.get("site_url")
 
     def ensure_run_id(self, tenant_id: str, engagement_id: str) -> str:
-        """Ensure a run_id exists for a given tenant and engagement."""
+        """
+        Returns an existing or newly created run_id for the given tenant and engagement.
+        """
         existing = self.db[COLL_MANAGEMENT].find_one({"tenant_id": tenant_id, "engagement_id": engagement_id})
         if existing:
             return existing["run_id"]
@@ -136,21 +159,11 @@ class SharePointProcessor:
         })
         return run_id
 
-    async def process(self, sp_folder_path: str, tenant_id: str, engagement_id: str):
-        """Ingest files from SharePoint folder and insert into MongoDB."""
-        folder_name = sp_folder_path.strip("/").split("/")[-1]
-        year, quarter = extract_year_quarter(folder_name)
-        if not year or not quarter:
-            return {"success": False, "message": "Invalid folder name format for year/quarter."}
-
-        try:
-            ctx = get_client_context()
-            folder = ctx.web.get_folder_by_server_relative_url(sp_folder_path)
-            ctx.load(folder)
-            ctx.execute_query()
-        except Exception as e:
-            return {"success": False, "message": f"SharePoint path error: {e}"}
-
+    async def ingest(self, folder, client, tenant_id: str, engagement_id: str, quarter: str, year: str):
+        """
+        Traverses SharePoint folders, extracts metadata, checks for duplicates, and inserts new files into MongoDB.
+        """
+        ctx = client.get_context()
         run_id = self.ensure_run_id(tenant_id, engagement_id)
         ctx.load(folder.expand(["Folders"]))
         ctx.execute_query()
@@ -164,11 +177,10 @@ class SharePointProcessor:
                 for obligor_folder in industry_folder.folders:
                     obligor = obligor_folder.properties["Name"]
                     doc_run_id = f"{industry}_{quarter}_{year}_{obligor.replace(' ', '_')}"
-
                     ctx.load(obligor_folder.expand(["Folders", "Files"]))
                     ctx.execute_query()
-                    all_files = await fetch_all_files(ctx, obligor_folder)
 
+                    all_files = await client.fetch_all_files(obligor_folder)
                     existing_base64s = set(
                         doc["base64"] for doc in self.db[COLL_DOCUMENTS].find({"doc_run_id": doc_run_id}, {"base64": 1})
                     )
@@ -176,12 +188,12 @@ class SharePointProcessor:
                     new_docs = []
 
                     for file_obj in all_files:
-                        base64_str = get_base64_content(ctx, file_obj)
+                        base64_str = client.get_base64_content(file_obj)
                         if not base64_str or base64_str in seen_base64s or base64_str in existing_base64s:
                             continue
                         seen_base64s.add(base64_str)
 
-                        doc_data = DocumentModel(
+                        doc = DocumentModel(
                             doc_run_id=doc_run_id,
                             run_id=run_id,
                             tenant_id=tenant_id,
@@ -196,7 +208,7 @@ class SharePointProcessor:
                             sharepoint_info={
                                 "relative_path": file_obj.properties["ServerRelativeUrl"],
                                 "library_name": "Documents",
-                                "site_url": ctx.base_url
+                                "site_url": self.site_url
                             },
                             steps=[{
                                 "step_name": "sharepoint_ingestion",
@@ -204,19 +216,21 @@ class SharePointProcessor:
                                 "timestamp": datetime.utcnow().isoformat()
                             }]
                         )
-                        new_docs.append(doc_data.dict())
+                        new_docs.append(doc.dict())
 
                     if new_docs:
                         self.db[COLL_DOCUMENTS].insert_many(new_docs)
-                        self._update_management(run_id, year, quarter, industry, obligor, doc_run_id)
+                        self._update_run_metadata(run_id, year, quarter, industry, obligor, doc_run_id)
 
         except Exception as e:
-            return {"success": False, "message": f"Error during folder processing: {e}"}
+            return {"success": False, "message": f"Processing error: {e}"}
 
-        return {"success": True, "run_id": run_id, "message": "Documents processed successfully."}
+        return {"success": True, "message": "Ingestion completed.", "run_id": run_id}
 
-    def _update_management(self, run_id, year, quarter, industry, obligor, doc_run_id):
-        """Update run_management structure based on incoming document run."""
+    def _update_run_metadata(self, run_id, year, quarter, industry, obligor, doc_run_id):
+        """
+        Updates metadata structure in run_management to link quarter/industry/obligor with doc_run_id.
+        """
         run_doc = self.db[COLL_MANAGEMENT].find_one({"run_id": run_id})
         updated = False
         for meta in run_doc["metadata"]:
@@ -238,23 +252,42 @@ class SharePointProcessor:
                 "industries": [{"industry": industry, "obligors": [{"obligor_name": obligor, "doc_run_id": doc_run_id}]}]
             })
             updated = True
+
         if updated:
             self.db[COLL_MANAGEMENT].replace_one({"_id": run_doc["_id"]}, run_doc)
 
-# ---------------- test_sharepoint.py ----------------
+# ---------------- test/test_sharepoint_ingestion.py ----------------
 import asyncio
-from app.db.mongo_ops import get_mongo_client
-from app.sharepoint.processor import SharePointProcessor
+import yaml
+from app.db.mongo_client import MongoConnector
+from app.sharepoint.client import SharePointClient
+from app.sharepoint.ingestion_service import SharePointIngestionService
 
-async def run_test():
-    db = get_mongo_client()
-    processor = SharePointProcessor(db)
-    result = await processor.process(
-        sp_folder_path="/sites/AppleBankAndCitiPOC/Shared Documents/General/test_bank22/Q1 2025",
-        tenant_id="medconnect",
-        engagement_id="applebank"
-    )
+async def test():
+    """
+    Test script to simulate SharePoint ingestion with mocked inputs.
+    """
+    with open("app/config/settings.yaml", "r") as f:
+        config = yaml.safe_load(f)
+
+    db = MongoConnector().get_database()
+    site_url = config["site_url"]
+    client_id = config["client_id"]
+    client_secret = config["client_secret"]
+
+    sp_client = SharePointClient(site_url, client_id, client_secret)
+    processor = SharePointIngestionService(db, config)
+
+    folder_path = "/sites/AppleBankAndCitiPOC/Shared Documents/General/test_bank22/Q1 2025"
+    folder_name = folder_path.strip("/").split("/")[-1]
+    year, quarter = sp_client.extract_year_quarter(folder_name)
+    if not year or not quarter:
+        print("[ERROR] Could not extract year/quarter")
+        return
+
+    folder = sp_client.get_folder(folder_path)
+    result = await processor.ingest(folder, sp_client, tenant_id="medconnect", engagement_id="applebank", quarter=quarter, year=year)
     print(result)
 
 if __name__ == "__main__":
-    asyncio.run(run_test())
+    asyncio.run(test())
