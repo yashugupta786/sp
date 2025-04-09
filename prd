@@ -1,15 +1,14 @@
 # ---------------- app/config/settings.yaml ----------------
-site_url: "https://tes/AppleBankAndCitiPOC"
 client_id: "your-client-id"
 client_secret: "your-client-secret"
 mongo_uri: "mongodb://localhost:27017"
 database: "test"
 
-# ---------------- app/db/mongo_client.py ----------------
+# ---------------- app/db/mongo_connection.py ----------------
 import yaml
 from pymongo import MongoClient
 
-class MongoConnector:
+class MongoDBClient:
     """
     Handles MongoDB client creation and database connection
     by reading from a YAML config file.
@@ -63,7 +62,7 @@ class DocumentModel(BaseModel):
     sharepoint_info: SharePointInfoModel
     steps: List[StepModel]
 
-# ---------------- app/sharepoint/client.py ----------------
+# ---------------- app/sharepoint/sharepoint_client.py ----------------
 import base64
 import io
 import re
@@ -128,74 +127,60 @@ class SharePointClient:
 
 # ---------------- app/sharepoint/ingestion_service.py ----------------
 import uuid
-from datetime import datetime
-from app.model.document_schema import DocumentModel
-
-COLL_MANAGEMENT = "run_management"
-COLL_DOCUMENTS = "run_documents"
+from typing import Dict, Any
+from app.model.document_schema import DocumentModel, StepModel, SharePointInfoModel
 
 class SharePointIngestionService:
     """
-    Handles business logic for SharePoint file ingestion and MongoDB updates.
+    Responsible for parsing SharePoint folder structures,
+    deduplicating files, and updating MongoDB with document metadata.
     """
-    def __init__(self, db, config):
+    def __init__(self, db, config: Dict[str, Any]):
         self.db = db
-        self.config = config
-        self.site_url = config.get("site_url")
+        self.run_collection = db["run_management"]
+        self.doc_collection = db["run_documents"]
+        self.site_url = config["site_url"]
 
-    def ensure_run_id(self, tenant_id: str, engagement_id: str) -> str:
+    async def ingest(self, folder, sp_client, tenant_id: str, engagement_id: str, quarter: str, year: str):
         """
-        Returns an existing or newly created run_id for the given tenant and engagement.
+        Ingests documents from SharePoint into MongoDB based on metadata structure.
         """
-        existing = self.db[COLL_MANAGEMENT].find_one({"tenant_id": tenant_id, "engagement_id": engagement_id})
-        if existing:
-            return existing["run_id"]
-        run_id = f"RUN{str(self.db[COLL_MANAGEMENT].estimated_document_count() + 1).zfill(3)}"
-        self.db[COLL_MANAGEMENT].insert_one({
-            "run_id": run_id,
-            "tenant_id": tenant_id,
-            "engagement_id": engagement_id,
-            "metadata": []
-        })
-        return run_id
-
-    async def ingest(self, folder, client, tenant_id: str, engagement_id: str, quarter: str, year: str):
-        """
-        Traverses SharePoint folders, extracts metadata, checks for duplicates, and inserts new files into MongoDB.
-        """
-        ctx = client.get_context()
-        run_id = self.ensure_run_id(tenant_id, engagement_id)
-        ctx.load(folder.expand(["Folders"]))
-        ctx.execute_query()
-
         try:
-            for industry_folder in folder.folders:
-                industry = industry_folder.properties["Name"]
-                ctx.load(industry_folder.expand(["Folders"]))
-                ctx.execute_query()
+            self._load(folder)
+            industries = folder.folders
+            if not industries:
+                return {"message": "No industry folders found."}
 
+            new_documents = []
+            for industry_folder in industries:
+                industry = industry_folder.properties["Name"]
+                self._load(industry_folder)
                 for obligor_folder in industry_folder.folders:
                     obligor = obligor_folder.properties["Name"]
-                    doc_run_id = f"{industry}_{quarter}_{year}_{obligor.replace(' ', '_')}"
-                    ctx.load(obligor_folder.expand(["Folders", "Files"]))
-                    ctx.execute_query()
-
-                    all_files = await client.fetch_all_files(obligor_folder)
-                    existing_base64s = set(
-                        doc["base64"] for doc in self.db[COLL_DOCUMENTS].find({"doc_run_id": doc_run_id}, {"base64": 1})
-                    )
-                    seen_base64s = set()
-                    new_docs = []
+                    self._load(obligor_folder)
+                    all_files = await sp_client.fetch_all_files(obligor_folder)
 
                     for file_obj in all_files:
-                        base64_str = client.get_base64_content(file_obj)
-                        if not base64_str or base64_str in seen_base64s or base64_str in existing_base64s:
+                        base64_str = sp_client.get_base64_content(file_obj)
+                        if not base64_str:
                             continue
-                        seen_base64s.add(base64_str)
 
-                        doc = DocumentModel(
-                            doc_run_id=doc_run_id,
-                            run_id=run_id,
+                        existing_doc = self.doc_collection.find_one({
+                            "tenant_id": tenant_id,
+                            "engagement_id": engagement_id,
+                            "year": int(year),
+                            "quarter": quarter,
+                            "industry_type": industry,
+                            "obligor_name": obligor,
+                            "base64": base64_str
+                        })
+
+                        if existing_doc:
+                            continue
+
+                        doc_model = DocumentModel(
+                            doc_run_id=f"{industry}_{quarter}_{year}_{obligor.replace(' ', '_')}",
+                            run_id=self._get_or_create_run_id(tenant_id, engagement_id),
                             tenant_id=tenant_id,
                             engagement_id=engagement_id,
                             year=int(year),
@@ -204,81 +189,78 @@ class SharePointIngestionService:
                             obligor_name=obligor,
                             doc_id=str(uuid.uuid4()),
                             original_filename=file_obj.properties["Name"],
+                            renamed_filename="",
                             base64=base64_str,
-                            sharepoint_info={
-                                "relative_path": file_obj.properties["ServerRelativeUrl"],
-                                "library_name": "Documents",
-                                "site_url": self.site_url
-                            },
-                            steps=[{
-                                "step_name": "sharepoint_ingestion",
-                                "result": "SUCCESS",
-                                "timestamp": datetime.utcnow().isoformat()
-                            }]
+                            sharepoint_info=SharePointInfoModel(
+                                relative_path=file_obj.properties["ServerRelativeUrl"],
+                                library_name="Documents",
+                                site_url=self.site_url
+                            ),
+                            steps=[StepModel(
+                                step_name="ingestion",
+                                result="success",
+                                timestamp=str(uuid.uuid1().time)
+                            )]
                         )
-                        new_docs.append(doc.dict())
+                        self.doc_collection.insert_one(doc_model.dict())
+                        new_documents.append(doc_model.doc_id)
 
-                    if new_docs:
-                        self.db[COLL_DOCUMENTS].insert_many(new_docs)
-                        self._update_run_metadata(run_id, year, quarter, industry, obligor, doc_run_id)
-
+            return {"message": "Ingestion complete.", "documents_added": len(new_documents)}
         except Exception as e:
-            return {"success": False, "message": f"Processing error: {e}"}
+            return {"error": str(e)}
 
-        return {"success": True, "message": "Ingestion completed.", "run_id": run_id}
-
-    def _update_run_metadata(self, run_id, year, quarter, industry, obligor, doc_run_id):
+    def _get_or_create_run_id(self, tenant_id: str, engagement_id: str) -> str:
         """
-        Updates metadata structure in run_management to link quarter/industry/obligor with doc_run_id.
+        Retrieves or creates a new run_id for the given tenant and engagement.
         """
-        run_doc = self.db[COLL_MANAGEMENT].find_one({"run_id": run_id})
-        updated = False
-        for meta in run_doc["metadata"]:
-            if meta["year"] == int(year) and meta["quarter"] == quarter:
-                for ind in meta["industries"]:
-                    if ind["industry"] == industry:
-                        if not any(o["obligor_name"] == obligor for o in ind["obligors"]):
-                            ind["obligors"].append({"obligor_name": obligor, "doc_run_id": doc_run_id})
-                            updated = True
-                        break
-                else:
-                    meta["industries"].append({"industry": industry, "obligors": [{"obligor_name": obligor, "doc_run_id": doc_run_id}]})
-                    updated = True
-                break
-        else:
-            run_doc["metadata"].append({
-                "year": int(year),
-                "quarter": quarter,
-                "industries": [{"industry": industry, "obligors": [{"obligor_name": obligor, "doc_run_id": doc_run_id}]}]
-            })
-            updated = True
+        existing = self.run_collection.find_one({
+            "tenant_id": tenant_id,
+            "engagement_id": engagement_id
+        })
+        if existing:
+            return existing["run_id"]
+        run_id = f"RUN{str(self.run_collection.estimated_document_count() + 1).zfill(3)}"
+        self.run_collection.insert_one({
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "engagement_id": engagement_id,
+            "metadata": []
+        })
+        return run_id
 
-        if updated:
-            self.db[COLL_MANAGEMENT].replace_one({"_id": run_doc["_id"]}, run_doc)
+    def _load(self, folder):
+        """
+        Loads the folders and files inside a given SharePoint folder.
+        """
+        folder.context.load(folder.expand(["Folders", "Files"]))
+        folder.context.execute_query()
 
 # ---------------- test/test_sharepoint_ingestion.py ----------------
 import asyncio
 import yaml
-from app.db.mongo_client import MongoConnector
-from app.sharepoint.client import SharePointClient
+from app.db.mongo_connection import MongoDBClient
+from app.sharepoint.sharepoint_client import SharePointClient
 from app.sharepoint.ingestion_service import SharePointIngestionService
 
 async def test():
     """
-    Test script to simulate SharePoint ingestion with mocked inputs.
+    Test script to simulate SharePoint ingestion with user-provided site_url.
     """
     with open("app/config/settings.yaml", "r") as f:
         config = yaml.safe_load(f)
 
-    db = MongoConnector().get_database()
-    site_url = config["site_url"]
+    db = MongoDBClient().get_database()
+    site_url = input("Enter SharePoint site URL: ").strip()
     client_id = config["client_id"]
     client_secret = config["client_secret"]
 
     sp_client = SharePointClient(site_url, client_id, client_secret)
-    processor = SharePointIngestionService(db, config)
+    processor = SharePointIngestionService(db, {"site_url": site_url})
 
-    folder_path = "/sites/AppleBankAndCitiPOC/Shared Documents/General/test_bank22/Q1 2025"
+    folder_path = input("Enter SharePoint folder path (e.g., /sites/.../Q1 2025): ").strip()
+    tenant_id = input("Enter tenant ID: ").strip()
+    engagement_id = input("Enter engagement ID: ").strip()
+
     folder_name = folder_path.strip("/").split("/")[-1]
     year, quarter = sp_client.extract_year_quarter(folder_name)
     if not year or not quarter:
@@ -286,7 +268,7 @@ async def test():
         return
 
     folder = sp_client.get_folder(folder_path)
-    result = await processor.ingest(folder, sp_client, tenant_id="medconnect", engagement_id="applebank", quarter=quarter, year=year)
+    result = await processor.ingest(folder, sp_client, tenant_id=tenant_id, engagement_id=engagement_id, quarter=quarter, year=year)
     print(result)
 
 if __name__ == "__main__":
