@@ -1,0 +1,240 @@
+# ---------------- app/model/sharepoint_metadata_request.py ----------------
+from pydantic import BaseModel
+
+class SharePointMetadataRequest(BaseModel):
+    site_url: str
+    sp_folder_path: str  # Base path like /sites/.../test_bank
+    tenant_id: str
+    engagement_id: str
+
+
+# ---------------- app/utils/response_handler.py ----------------
+def success_response(data: dict = None, message: str = "") -> dict:
+    if data is None:
+        data = {}
+    return {"status": "success", "message": message, **data}
+
+def error_response(message: str = "An error occurred") -> dict:
+    return {"status": "error", "message": message}
+
+
+# ---------------- app/sharepoint/metadata_service.py ----------------
+import re
+import uuid
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+from datetime import datetime
+
+def extract_year_quarter(folder_name: str):
+    """
+    Extract the year and quarter from a folder name.
+    Supports formats like Q1_2024, Q2 2023, etc.
+
+    Args:
+        folder_name (str): Name of the folder.
+
+    Returns:
+        tuple: (year, quarter) or (None, None) if pattern not matched.
+    """
+    match = re.match(r"(?i)(Q[1-4])[_\s]?(\d{4})", folder_name.strip())
+    if match:
+        return match.group(2), match.group(1).upper()
+    return None, None
+
+def traverse_metadata(ctx, base_folder, tenant_id, engagement_id):
+    """
+    Traverse SharePoint folder hierarchy to extract metadata.
+
+    Args:
+        ctx (ClientContext): Authenticated SharePoint client context.
+        base_folder (Folder): The root folder path for scanning.
+        tenant_id (str): Tenant identifier.
+        engagement_id (str): Engagement identifier.
+
+    Returns:
+        List[dict]: List of extracted metadata entries.
+    """
+    ctx.load(base_folder.expand(["Folders"]))
+    ctx.execute_query()
+
+    metadata_entries = []
+
+    for quarter_folder in base_folder.folders:
+        year, quarter = extract_year_quarter(quarter_folder.properties["Name"])
+        if not year or not quarter:
+            continue
+
+        ctx.load(quarter_folder.expand(["Folders"]))
+        ctx.execute_query()
+
+        for sub_product_folder in quarter_folder.folders:
+            sub_product_type = sub_product_folder.properties["Name"]
+            ctx.load(sub_product_folder.expand(["Folders"]))
+            ctx.execute_query()
+
+            for obligor_folder in sub_product_folder.folders:
+                obligor = obligor_folder.properties["Name"]
+                doc_run_id = f"{uuid.uuid4()}"
+
+                metadata_entries.append({
+                    "year": int(year),
+                    "quarter": quarter,
+                    "sub_product_type": sub_product_type,
+                    "obligor_name": obligor,
+                    "doc_run_id": doc_run_id
+                })
+    return metadata_entries
+
+def store_metadata(db, tenant_id, engagement_id, metadata_entries):
+    """
+    Store metadata into MongoDB's run_management collection.
+
+    Args:
+        db: MongoDB database instance.
+        tenant_id (str): Tenant identifier.
+        engagement_id (str): Engagement identifier.
+        metadata_entries (List[dict]): Extracted metadata list.
+
+    Returns:
+        str: run_id used for the metadata.
+    """
+    run_management = db["run_management"]
+
+    run_doc = run_management.find_one({"tenant_id": tenant_id, "engagement_id": engagement_id})
+    if not run_doc:
+        run_id = f"RUN{str(run_management.estimated_document_count() + 1).zfill(3)}"
+        doc = {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "engagement_id": engagement_id,
+            "metadata": []
+        }
+        run_management.insert_one(doc)
+        run_doc = doc
+    else:
+        run_id = run_doc["run_id"]
+
+    existing_meta = run_doc.get("metadata", [])
+
+    for entry in metadata_entries:
+        year = entry["year"]
+        quarter = entry["quarter"]
+        sub_product_type = entry["sub_product_type"]
+        obligor_name = entry["obligor_name"]
+        doc_run_id = entry["doc_run_id"]
+
+        match_yq = next((m for m in existing_meta if m["year"] == year and m["quarter"] == quarter), None)
+        if not match_yq:
+            existing_meta.append({
+                "year": year,
+                "quarter": quarter,
+                "industries": [{
+                    "sub_product_type": sub_product_type,
+                    "obligors": [{"obligor_name": obligor_name, "doc_run_id": doc_run_id}]
+                }]
+            })
+        else:
+            match_industry = next((i for i in match_yq["industries"] if i["sub_product_type"] == sub_product_type), None)
+            if not match_industry:
+                match_yq["industries"].append({
+                    "sub_product_type": sub_product_type,
+                    "obligors": [{"obligor_name": obligor_name, "doc_run_id": doc_run_id}]
+                })
+            else:
+                if not any(o["obligor_name"] == obligor_name for o in match_industry["obligors"]):
+                    match_industry["obligors"].append({"obligor_name": obligor_name, "doc_run_id": doc_run_id})
+
+    run_management.update_one({"run_id": run_id}, {"$set": {"metadata": existing_meta}})
+    return run_id
+
+def extract_and_store_metadata(site_url, sp_folder_path, tenant_id, engagement_id, client_id, client_secret, db):
+    """
+    Entry point to extract metadata from SharePoint and store in MongoDB.
+
+    Args:
+        site_url (str): SharePoint site URL.
+        sp_folder_path (str): SharePoint folder path.
+        tenant_id (str): Tenant ID.
+        engagement_id (str): Engagement ID.
+        client_id (str): SharePoint client ID.
+        client_secret (str): SharePoint client secret.
+        db: MongoDB client database.
+
+    Returns:
+        Tuple[List[dict], str]: Metadata list and run_id used.
+    """
+    credentials = ClientCredential(client_id, client_secret)
+    ctx = ClientContext(site_url).with_credentials(credentials)
+
+    base_folder = ctx.web.get_folder_by_server_relative_url(sp_folder_path)
+    ctx.load(base_folder)
+    ctx.execute_query()
+
+    metadata_entries = traverse_metadata(ctx, base_folder, tenant_id, engagement_id)
+    run_id = store_metadata(db, tenant_id, engagement_id, metadata_entries)
+
+    return metadata_entries, run_id
+
+
+# ---------------- app/routes/sharepoint_metadata.py ----------------
+from fastapi import APIRouter, HTTPException
+from app.db.mongo_client import MongoDBClient
+from app.model.sharepoint_metadata_request import SharePointMetadataRequest
+from app.utils.response_handler import success_response, error_response
+from app.sharepoint.metadata_service import extract_and_store_metadata
+import yaml
+
+router = APIRouter()
+
+@router.post("/fetch-sharepoint-metadata")
+def fetch_sharepoint_metadata(request: SharePointMetadataRequest):
+    """
+    API endpoint to fetch SharePoint metadata and persist it.
+
+    Args:
+        request (SharePointMetadataRequest): Request body with SharePoint access info.
+
+    Returns:
+        dict: Success or error response.
+    """
+    try:
+        with open("app/config/settings.yaml", "r") as f:
+            config = yaml.safe_load(f)
+
+        db = MongoDBClient().get_database()
+
+        metadata_entries, run_id = extract_and_store_metadata(
+            site_url=request.site_url,
+            sp_folder_path=request.sp_folder_path,
+            tenant_id=request.tenant_id,
+            engagement_id=request.engagement_id,
+            client_id=config["client_id"],
+            client_secret=config["client_secret"],
+            db=db
+        )
+
+        return success_response({
+            "run_id": run_id,
+            "total": len(metadata_entries),
+            "metadata": metadata_entries
+        }, message="Metadata fetched and stored successfully.")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=error_response(str(e)))
+
+
+# ---------------- app/main.py ----------------
+from fastapi import FastAPI
+from app.routes.sharepoint_metadata import router as metadata_router
+
+app = FastAPI(title="Loan File Review - Metadata Ingestion")
+
+app.include_router(metadata_router, prefix="/api/sharepoint", tags=["SharePoint Metadata"])
+
+@app.get("/test-ping")
+def ping():
+    return {"message": "API is running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
