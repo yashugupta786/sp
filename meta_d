@@ -1,0 +1,231 @@
+import re
+import hashlib
+from typing import List, Tuple
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+
+
+class SharePointMetadataService:
+    """
+    Service to handle metadata extraction from SharePoint and store it in MongoDB.
+    """
+
+    def __init__(self, site_url: str, client_id: str, client_secret: str, db):
+        """
+        Initialize the SharePoint client and MongoDB.
+
+        Args:
+            site_url (str): SharePoint site URL.
+            client_id (str): Client ID from Azure App registration.
+            client_secret (str): Client Secret for authentication.
+            db: MongoDB database instance.
+        """
+        credentials = ClientCredential(client_id, client_secret)
+        self.ctx = ClientContext(site_url).with_credentials(credentials)
+        self.db = db
+        self.site_url = site_url
+
+    def extract_year_quarter(self, folder_name: str) -> Tuple[str, str]:
+        """
+        Extract year and quarter from folder name (e.g., Q1_2024, Q1 2023).
+
+        Args:
+            folder_name (str): Folder name.
+
+        Returns:
+            Tuple[str, str]: (year, quarter) if found, else (None, None).
+        """
+        match = re.match(r"(?i)(Q[1-4])[_\s]?(\d{4})", folder_name.strip())
+        if match:
+            return match.group(2), match.group(1).upper()
+        return None, None
+
+    def generate_doc_run_id(
+        self,
+        tenant_id: str,
+        engagement_id: str,
+        year: int,
+        quarter: str,
+        sub_product_type: str,
+        obligor_name: str,
+    ) -> str:
+        """
+        Generate consistent doc_run_id using hash of metadata identifiers.
+
+        Returns:
+            str: Hashed doc_run_id
+        """
+        key = f"{tenant_id}_{engagement_id}_{year}_{quarter}_{sub_product_type}_{obligor_name}"
+        return f"DOC_{hashlib.md5(key.encode()).hexdigest()}"
+
+    def traverse_sharepoint_folders(
+        self, base_folder, tenant_id: str, engagement_id: str
+    ) -> List[dict]:
+        """
+        Traverse the SharePoint folder hierarchy to extract metadata.
+
+        Args:
+            base_folder: SharePoint folder object.
+            tenant_id: Tenant ID.
+            engagement_id: Engagement ID.
+
+        Returns:
+            List[dict]: Extracted metadata.
+        """
+        metadata_entries = []
+
+        self.ctx.load(base_folder.expand(["Folders"]))
+        self.ctx.execute_query()
+
+        for quarter_folder in base_folder.folders:
+            year, quarter = self.extract_year_quarter(quarter_folder.properties["Name"])
+            if not year or not quarter:
+                continue
+
+            self.ctx.load(quarter_folder.expand(["Folders"]))
+            self.ctx.execute_query()
+
+            for sub_product_folder in quarter_folder.folders:
+                sub_product_type = sub_product_folder.properties["Name"]
+                self.ctx.load(sub_product_folder.expand(["Folders"]))
+                self.ctx.execute_query()
+
+                for obligor_folder in sub_product_folder.folders:
+                    obligor_name = obligor_folder.properties["Name"]
+
+                    # Only store if obligor folder has content
+                    self.ctx.load(obligor_folder.expand(["Folders", "Files"]))
+                    self.ctx.execute_query()
+
+                    if len(obligor_folder.files) == 0 and len(obligor_folder.folders) == 0:
+                        continue  # Skip empty folders
+
+                    doc_run_id = self.generate_doc_run_id(
+                        tenant_id,
+                        engagement_id,
+                        int(year),
+                        quarter,
+                        sub_product_type,
+                        obligor_name,
+                    )
+
+                    metadata_entries.append(
+                        {
+                            "year": int(year),
+                            "quarter": quarter,
+                            "sub_product_type": sub_product_type,
+                            "obligor_name": obligor_name,
+                            "doc_run_id": doc_run_id,
+                        }
+                    )
+
+        return metadata_entries
+
+    def store_metadata_in_mongo(
+        self,
+        tenant_id: str,
+        engagement_id: str,
+        metadata_entries: List[dict],
+    ) -> str:
+        """
+        Store metadata in MongoDB `run_management` collection.
+
+        Args:
+            tenant_id: Tenant ID.
+            engagement_id: Engagement ID.
+            metadata_entries: List of metadata to store.
+
+        Returns:
+            str: run_id
+        """
+        run_management = self.db["run_management"]
+
+        run_doc = run_management.find_one(
+            {"tenant_id": tenant_id, "engagement_id": engagement_id}
+        )
+
+        if not run_doc:
+            run_id = f"RUN{str(run_management.estimated_document_count() + 1).zfill(3)}"
+            run_doc = {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "engagement_id": engagement_id,
+                "metadata": [],
+            }
+            run_management.insert_one(run_doc)
+        else:
+            run_id = run_doc["run_id"]
+
+        existing_metadata = run_doc.get("metadata", [])
+
+        for entry in metadata_entries:
+            year = entry["year"]
+            quarter = entry["quarter"]
+            sub_product_type = entry["sub_product_type"]
+            obligor_name = entry["obligor_name"]
+            doc_run_id = entry["doc_run_id"]
+
+            match_yq = next(
+                (m for m in existing_metadata if m["year"] == year and m["quarter"] == quarter),
+                None,
+            )
+
+            if not match_yq:
+                existing_metadata.append(
+                    {
+                        "year": year,
+                        "quarter": quarter,
+                        "industries": [
+                            {
+                                "sub_product_type": sub_product_type,
+                                "obligors": [{"obligor_name": obligor_name, "doc_run_id": doc_run_id}],
+                            }
+                        ],
+                    }
+                )
+            else:
+                match_industry = next(
+                    (i for i in match_yq["industries"] if i["sub_product_type"] == sub_product_type),
+                    None,
+                )
+                if not match_industry:
+                    match_yq["industries"].append(
+                        {
+                            "sub_product_type": sub_product_type,
+                            "obligors": [{"obligor_name": obligor_name, "doc_run_id": doc_run_id}],
+                        }
+                    )
+                else:
+                    if not any(o["obligor_name"] == obligor_name for o in match_industry["obligors"]):
+                        match_industry["obligors"].append(
+                            {"obligor_name": obligor_name, "doc_run_id": doc_run_id}
+                        )
+
+        run_management.update_one({"run_id": run_id}, {"$set": {"metadata": existing_metadata}})
+        return run_id
+
+    def process_and_store_metadata(
+        self,
+        tenant_id: str,
+        engagement_id: str,
+        sp_folder_path: str,
+    ) -> Tuple[List[dict], str]:
+        """
+        Entry point for extracting and storing metadata from SharePoint.
+
+        Args:
+            tenant_id: Tenant ID.
+            engagement_id: Engagement ID.
+            sp_folder_path: Base SharePoint folder path.
+
+        Returns:
+            Tuple[List[dict], str]: (List of metadata entries, run_id)
+        """
+        base_folder = self.ctx.web.get_folder_by_server_relative_url(sp_folder_path)
+        self.ctx.load(base_folder)
+        self.ctx.execute_query()
+
+        metadata_entries = self.traverse_sharepoint_folders(base_folder, tenant_id, engagement_id)
+        run_id = self.store_metadata_in_mongo(tenant_id, engagement_id, metadata_entries)
+
+        return metadata_entries, run_id
